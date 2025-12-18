@@ -3,23 +3,38 @@
 # Load and validate raw data from WOS and NBER sources
 # ==============================================================================
 
-# Load configuration
+# Load configuration and specialized parsers
 if (!exists("config")) source("src/00_config.R")
+source("src/data_models.R")
+source("src/wos_parser.R")
+source("src/nber_parser.R")
 
 # ------------------------------------------------------------------------------
 # WOS DATA LOADING
 # ------------------------------------------------------------------------------
+# WOS data format: Tab-separated files with ID and reference columns
+# Reference format: "Author Year Page Citations Title Journal"
+#
+# Example line:
+#   WOS:000060312800003	Diepenmaat-Wolters, MGE 1997 147 55 High-performance... JOURNAL NAME
+# ------------------------------------------------------------------------------
 
-#' Load all WOS CSV files from the raw data directory
+#' Load all WOS files from the raw data directory with parsing
 #'
-#' @param path Directory containing WOS CSV files
-#' @param pattern File pattern to match (default: "*.csv")
-#' @return Tibble with combined WOS data
+#' Supports both TSV (.txt) and CSV (.csv) formats.
+#' Uses structured parsing to extract author, year, page, citations,
+#' title, and journal from reference strings.
+#'
+#' @param path Directory containing WOS files
+#' @param pattern File pattern to match (default: txt and csv files)
+#' @param parse_references Parse reference strings into fields? Default TRUE
+#' @return Tibble with parsed WOS data
 #'
 #' @examples
 #' wos_data <- load_wos_corpus("data/raw/wos")
 load_wos_corpus <- function(path = config$paths$wos_raw,
-                            pattern = "\\.csv$") {
+                            pattern = "\\.(txt|csv)$",
+                            parse_references = TRUE) {
 
   # Validate path exists
   if (!dir.exists(path)) {
@@ -30,62 +45,96 @@ load_wos_corpus <- function(path = config$paths$wos_raw,
   files <- list.files(path, pattern = pattern, full.names = TRUE)
 
   if (length(files) == 0) {
-    warning("No CSV files found in: ", path)
-    return(tibble())
+    warning("No WOS files found in: ", path)
+    return(create_wos_schema())
   }
 
-  message("Loading ", length(files), " WOS file(s)...")
+  message("Loading ", length(files), " WOS file(s) with structured parsing...")
 
-  # Load and combine all files
-  wos_data <- files %>%
-    map(function(f) {
-      message("  - ", basename(f))
-      read_csv(f, show_col_types = FALSE)
-    }) %>%
-    bind_rows()
+  # Use the new parser module
+  wos_data <- load_wos_directory(path, pattern)
 
   message("Loaded ", nrow(wos_data), " WOS records")
 
-  # Basic validation
-  if (!"reference" %in% names(wos_data)) {
-    warning("Expected 'reference' column not found. Available columns: ",
-            paste(names(wos_data), collapse = ", "))
+  # Show parsing diagnostics
+  if (nrow(wos_data) > 0) {
+    print_wos_diagnostics(wos_data)
   }
 
   return(wos_data)
 }
 
-#' Load a single WOS CSV file
+#' Load a single WOS file with parsing
 #'
-#' @param file_path Path to WOS CSV file
-#' @return Tibble with WOS data
+#' @param file_path Path to WOS file (TSV or CSV)
+#' @return Tibble with parsed WOS data
 load_wos_file <- function(file_path) {
 
   if (!file.exists(file_path)) {
     stop("File does not exist: ", file_path)
   }
 
-  wos_data <- read_csv(file_path, show_col_types = FALSE)
+  # Detect format and use appropriate loader
+  if (str_detect(file_path, "\\.csv$")) {
+    wos_data <- load_wos_csv(file_path)
+  } else {
+    wos_data <- load_wos_tsv(file_path)
+  }
 
   message("Loaded ", nrow(wos_data), " records from ", basename(file_path))
 
   return(wos_data)
 }
 
+#' Load WOS data without parsing (raw format)
+#'
+#' For cases where structured parsing is not needed.
+#'
+#' @param path Directory containing WOS files
+#' @return Tibble with raw reference strings
+load_wos_raw <- function(path = config$paths$wos_raw) {
+
+  files <- list.files(path, pattern = "\\.(txt|csv)$", full.names = TRUE)
+
+  if (length(files) == 0) {
+    warning("No WOS files found in: ", path)
+    return(tibble(wos_id = character(), reference = character()))
+  }
+
+  all_data <- map(files, function(f) {
+    lines <- read_lines(f)
+    if (length(lines) > 0 && str_detect(lines[1], "^(ID|WOS)")) {
+      lines <- lines[-1]  # Skip header
+    }
+
+    tibble(raw = lines) %>%
+      separate(raw, into = c("wos_id", "reference"), sep = "\t", extra = "merge", fill = "right")
+  }) %>%
+    bind_rows()
+
+  return(all_data)
+}
+
 # ------------------------------------------------------------------------------
 # NBER DATA LOADING
+# ------------------------------------------------------------------------------
+# NBER papers contain bibliography sections with formatted citations.
+# Citation format: Authors (Year): "Title," Publication, Volume, Pages.
+#
+# Example citation:
+#   Barro, R. and J. Furman (2018): "Macroeconomic Effects," BPEA, 49, 257-345.
 # ------------------------------------------------------------------------------
 
 #' Load NBER paper text files
 #'
 #' @param path Directory containing NBER text files
-#' @param pattern File pattern to match (default: "w*.txt")
+#' @param pattern File pattern to match (default: "w*.txt" or "w*.pdf")
 #' @return Tibble with paper_id and text content
 #'
 #' @examples
 #' nber_data <- load_nber_papers("data/raw/nber")
 load_nber_papers <- function(path = config$paths$nber_raw,
-                             pattern = "^w\\d+\\.txt$") {
+                             pattern = "^w\\d+\\.(txt|pdf)$") {
 
   # Validate path exists
   if (!dir.exists(path)) {
@@ -96,7 +145,7 @@ load_nber_papers <- function(path = config$paths$nber_raw,
   files <- list.files(path, pattern = pattern, full.names = TRUE)
 
   if (length(files) == 0) {
-    warning("No NBER text files found in: ", path)
+    warning("No NBER paper files found in: ", path)
     return(tibble(paper_id = character(), text = character()))
   }
 
@@ -121,18 +170,27 @@ load_nber_papers <- function(path = config$paths$nber_raw,
   return(select(nber_data, paper_id, text))
 }
 
-#' Safely read a text file
+#' Safely read a text or PDF file
 #'
 #' @param path File path
 #' @return File contents or NA if read fails
 read_file_safe <- function(path) {
-  tryCatch(
-    read_file(path),
-    error = function(e) {
-      warning("Failed to read: ", path, " - ", e$message)
-      NA_character_
+  tryCatch({
+    if (str_detect(path, "\\.pdf$")) {
+      # Read PDF
+      if (!requireNamespace("pdftools", quietly = TRUE)) {
+        warning("pdftools package required for PDF reading: ", path)
+        return(NA_character_)
+      }
+      paste(pdftools::pdf_text(path), collapse = "\n")
+    } else {
+      # Read text file
+      read_file(path)
     }
-  )
+  }, error = function(e) {
+    warning("Failed to read: ", path, " - ", e$message)
+    NA_character_
+  })
 }
 
 #' Load a single NBER paper
@@ -159,18 +217,68 @@ load_nber_paper <- function(paper_id, path = config$paths$nber_raw) {
   }
 }
 
+#' Load and parse NBER paper citations
+#'
+#' Combines paper loading with bibliography extraction and parsing.
+#'
+#' @param path Directory containing NBER files
+#' @param pattern File pattern to match
+#' @return Tibble with parsed citations from all papers
+#'
+#' @examples
+#' nber_citations <- load_nber_citations("data/raw/nber")
+load_nber_citations <- function(path = config$paths$nber_raw,
+                                pattern = "^w\\d+\\.(txt|pdf)$") {
+
+  # First load the papers
+  papers <- load_nber_papers(path, pattern)
+
+  if (nrow(papers) == 0) {
+    warning("No papers loaded")
+    return(create_nber_schema())
+  }
+
+  message("\nExtracting and parsing citations...")
+
+  # Extract and parse citations from each paper
+  all_citations <- map2(
+    papers$paper_id,
+    papers$text,
+    function(pid, txt) {
+      tryCatch(
+        extract_and_parse_paper(pid, txt),
+        error = function(e) {
+          warning("Failed to process ", pid, ": ", e$message)
+          create_nber_schema() %>% mutate(paper_id = pid)
+        }
+      )
+    },
+    .progress = TRUE
+  ) %>%
+    bind_rows()
+
+  # Show diagnostics
+  if (nrow(all_citations) > 0) {
+    print_nber_diagnostics(all_citations)
+  }
+
+  return(all_citations)
+}
+
 # ------------------------------------------------------------------------------
 # DATA VALIDATION
 # ------------------------------------------------------------------------------
 
 #' Validate WOS data structure
 #'
+#' Works with both raw (reference only) and parsed (all fields) formats.
+#'
 #' @param data WOS tibble
 #' @return TRUE if valid, stops with error if not
 validate_wos_data <- function(data) {
 
-  # Check for required columns
-  required_cols <- c("reference")
+  # Check for required columns (at minimum need wos_id and reference)
+  required_cols <- c("wos_id", "reference")
   missing <- setdiff(required_cols, names(data))
 
   if (length(missing) > 0) {
@@ -194,12 +302,21 @@ validate_wos_data <- function(data) {
   message("  - ", nrow(data), " total records")
   message("  - ", sum(!is.na(data$reference)), " valid references")
 
+  # If parsed, show parsing stats
+  if ("parse_status" %in% names(data)) {
+    status_tbl <- table(data$parse_status)
+    message("  - Parsing status:")
+    for (s in names(status_tbl)) {
+      message("      ", s, ": ", status_tbl[s])
+    }
+  }
+
   invisible(TRUE)
 }
 
-#' Validate NBER data structure
+#' Validate NBER paper data structure
 #'
-#' @param data NBER tibble
+#' @param data NBER papers tibble
 #' @return TRUE if valid, stops with error if not
 validate_nber_data <- function(data) {
 
@@ -230,6 +347,39 @@ validate_nber_data <- function(data) {
   invisible(TRUE)
 }
 
+#' Validate NBER parsed citations
+#'
+#' @param data NBER citations tibble (parsed format)
+#' @return TRUE if valid, stops with error if not
+validate_nber_citations <- function(data) {
+
+  # Check for required columns from parsed schema
+  required_cols <- c("paper_id", "citation_num", "year", "raw_citation")
+  missing <- setdiff(required_cols, names(data))
+
+  if (length(missing) > 0) {
+    stop("Missing required columns: ", paste(missing, collapse = ", "))
+  }
+
+  if (nrow(data) == 0) {
+    stop("NBER citations data is empty")
+  }
+
+  # Validate with schema validator
+  validation <- validate_nber_schema(data)
+
+  message("NBER citations validation passed:")
+  message("  - ", validation$n_records, " citations from ", validation$n_papers, " papers")
+
+  if (length(validation$warnings) > 0) {
+    for (w in validation$warnings) {
+      warning(w)
+    }
+  }
+
+  invisible(TRUE)
+}
+
 # ------------------------------------------------------------------------------
 # MAIN EXECUTION (if run as script)
 # ------------------------------------------------------------------------------
@@ -239,13 +389,24 @@ if (sys.nframe() == 0) {
   message("Running Data Ingestion")
   message(strrep("=", 60), "\n")
 
-  # Load WOS data
+  # Load and parse WOS data
+  message("\n--- WOS Data ---")
   wos_data <- load_wos_corpus()
   if (nrow(wos_data) > 0) validate_wos_data(wos_data)
 
-  # Load NBER data
-  nber_data <- load_nber_papers()
-  if (nrow(nber_data) > 0) validate_nber_data(nber_data)
+  # Load NBER papers
+  message("\n--- NBER Papers ---")
+  nber_papers <- load_nber_papers()
+  if (nrow(nber_papers) > 0) validate_nber_data(nber_papers)
+
+  # Optionally parse NBER citations
+  # nber_citations <- load_nber_citations()
+  # if (nrow(nber_citations) > 0) validate_nber_citations(nber_citations)
 
   message("\nData ingestion complete.")
+  message("Available functions:")
+  message("  - load_wos_corpus()       Load and parse WOS files")
+  message("  - load_wos_file()         Load single WOS file")
+  message("  - load_nber_papers()      Load NBER paper texts")
+  message("  - load_nber_citations()   Load and parse NBER citations")
 }
