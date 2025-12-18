@@ -1,447 +1,212 @@
 # ==============================================================================
 # CAUSAL ESTIMATION
-# Difference-in-differences and regression discontinuity analysis
+# Difference-in-Differences and Regression Discontinuity Analysis
+# ==============================================================================
+#
+# Key question: Did hallucination rates increase after ChatGPT release?
+#
+# Approach:
+# 1. DiD: Compare pre vs post, controlling for trends
+# 2. RDD: Look at discontinuity right at treatment date
+#
+# Treatment date: November 30, 2022 (ChatGPT release)
+#
 # ==============================================================================
 
-# Load configuration and dependencies
 if (!exists("config")) source("src/00_config.R")
 
 # ------------------------------------------------------------------------------
-# DATA PREPARATION FOR CAUSAL ANALYSIS
+# DATA PREP
 # ------------------------------------------------------------------------------
 
 #' Prepare data for causal analysis
 #'
-#' @param match_results Tibble with match results
-#' @param paper_dates Tibble mapping paper_id to publication date
-#' @param treatment_date Date of treatment (ChatGPT release)
-#' @return Tibble ready for regression analysis
-prepare_causal_data <- function(match_results,
-                                paper_dates,
-                                treatment_date = config$dates$treatment_date) {
+#' @param match_results Match results with distance and is_hallucination
+#' @param paper_dates Tibble with paper_id and pub_date
+#' @return Analysis-ready tibble
+prep_causal_data <- function(match_results, paper_dates,
+                             treatment_date = config$treatment_date) {
 
-  # Join and create treatment indicators
-  analysis_data <- match_results %>%
+  match_results %>%
     left_join(paper_dates, by = "paper_id") %>%
     filter(!is.na(pub_date)) %>%
     mutate(
-      # Treatment indicator
-      post_treatment = as.integer(pub_date >= treatment_date),
+      # Key treatment indicator
+      post = as.integer(pub_date >= treatment_date),
 
-      # Time variables for RDD
+      # Running variable for RDD
       days_from_treatment = as.numeric(pub_date - treatment_date),
-      weeks_from_treatment = days_from_treatment / 7,
-      months_from_treatment = days_from_treatment / 30.44,
 
-      # Calendar controls
+      # Time controls
       year = year(pub_date),
-      month = month(pub_date),
-      quarter = quarter(pub_date),
-
-      # Paper-level aggregates (if needed)
-      year_month = floor_date(pub_date, "month")
+      month = month(pub_date)
     )
-
-  return(analysis_data)
-}
-
-#' Aggregate data to paper level
-#'
-#' @param analysis_data Citation-level analysis data
-#' @return Paper-level tibble
-aggregate_to_paper_level <- function(analysis_data) {
-
-  paper_data <- analysis_data %>%
-    group_by(paper_id, pub_date, post_treatment, days_from_treatment,
-             year, month, quarter) %>%
-    summarize(
-      n_citations = n(),
-      mean_distance = mean(match_distance, na.rm = TRUE),
-      median_distance = median(match_distance, na.rm = TRUE),
-      max_distance = max(match_distance, na.rm = TRUE),
-      n_hallucinations = sum(potential_hallucination, na.rm = TRUE),
-      hallucination_rate = mean(potential_hallucination, na.rm = TRUE),
-      .groups = "drop"
-    )
-
-  return(paper_data)
 }
 
 # ------------------------------------------------------------------------------
 # DIFFERENCE-IN-DIFFERENCES
 # ------------------------------------------------------------------------------
 
-#' Run simple DiD regression
+#' Simple DiD regression
 #'
-#' @param analysis_data Prepared analysis data
-#' @param outcome Outcome variable name (default: "match_distance")
-#' @param controls Vector of control variable names
-#' @return lm model object
-run_did_regression <- function(analysis_data,
-                               outcome = "match_distance",
-                               controls = NULL) {
-
-  # Build formula
-  base_formula <- paste(outcome, "~ post_treatment")
-
-  if (!is.null(controls) && length(controls) > 0) {
-    control_terms <- paste(controls, collapse = " + ")
-    formula_str <- paste(base_formula, "+", control_terms)
-  } else {
-    formula_str <- base_formula
-  }
-
-  formula_obj <- as.formula(formula_str)
-
-  # Run regression
-  model <- lm(formula_obj, data = analysis_data)
-
-  return(model)
+#' Model: distance ~ post_treatment
+#'
+#' @param data Prepared analysis data
+#' @return lm model
+run_did <- function(data) {
+  lm(distance ~ post, data = data)
 }
 
-#' Run DiD with time fixed effects
+#' DiD with time fixed effects
 #'
-#' @param analysis_data Prepared analysis data
-#' @param outcome Outcome variable name
-#' @return lm model object
-run_did_with_fe <- function(analysis_data, outcome = "match_distance") {
-
-  formula_obj <- as.formula(
-    paste(outcome, "~ post_treatment + factor(month) + factor(year)")
-  )
-
-  model <- lm(formula_obj, data = analysis_data)
-
-  return(model)
-}
-
-#' Summarize regression results
+#' Model: distance ~ post_treatment + month FE + year FE
 #'
-#' @param model lm model object
-#' @return Tibble with coefficient summary
-summarize_regression <- function(model) {
-
-  summary_obj <- summary(model)
-  coef_table <- as.data.frame(summary_obj$coefficients)
-
-  tibble(
-    term = rownames(coef_table),
-    estimate = coef_table[, 1],
-    std_error = coef_table[, 2],
-    t_statistic = coef_table[, 3],
-    p_value = coef_table[, 4],
-    significance = case_when(
-      p_value < 0.001 ~ "***",
-      p_value < 0.01 ~ "**",
-      p_value < 0.05 ~ "*",
-      p_value < 0.1 ~ ".",
-      TRUE ~ ""
-    )
-  ) %>%
-    mutate(
-      ci_lower = estimate - 1.96 * std_error,
-      ci_upper = estimate + 1.96 * std_error
-    )
+#' @param data Prepared analysis data
+#' @return lm model
+run_did_with_fe <- function(data) {
+  lm(distance ~ post + factor(month) + factor(year), data = data)
 }
 
 # ------------------------------------------------------------------------------
 # REGRESSION DISCONTINUITY
 # ------------------------------------------------------------------------------
 
-#' Run RDD analysis
+#' RDD regression around the cutoff
 #'
-#' @param analysis_data Prepared analysis data
-#' @param outcome Outcome variable name
-#' @param bandwidth Bandwidth in days around treatment date
-#' @param polynomial_order Order of polynomial for running variable
-#' @return lm model object
-run_rdd <- function(analysis_data,
-                    outcome = "match_distance",
-                    bandwidth = 180,  # 6 months
-                    polynomial_order = 1) {
+#' Model: distance ~ post + days + post*days
+#'
+#' @param data Prepared analysis data
+#' @param bandwidth Days around treatment to include (default 180 = 6 months)
+#' @return lm model
+run_rdd <- function(data, bandwidth = 180) {
 
   # Filter to bandwidth
-  rdd_data <- analysis_data %>%
+  rdd_data <- data %>%
     filter(abs(days_from_treatment) <= bandwidth)
 
-  # Build polynomial terms
-  if (polynomial_order == 1) {
-    formula_str <- paste(
-      outcome,
-      "~ post_treatment + days_from_treatment + post_treatment:days_from_treatment"
-    )
-  } else if (polynomial_order == 2) {
-    formula_str <- paste(
-      outcome,
-      "~ post_treatment + days_from_treatment + I(days_from_treatment^2) +",
-      "post_treatment:days_from_treatment + post_treatment:I(days_from_treatment^2)"
-    )
-  } else {
-    stop("Only polynomial orders 1 and 2 are implemented")
-  }
-
-  model <- lm(as.formula(formula_str), data = rdd_data)
-
-  return(model)
+  # Linear RDD
+  lm(distance ~ post + days_from_treatment + post:days_from_treatment,
+     data = rdd_data)
 }
 
-#' Plot RDD visualization
-#'
-#' @param analysis_data Prepared analysis data
-#' @param bandwidth Bandwidth in days
-#' @param output_path Optional path to save figure
-#' @return ggplot object
-plot_rdd <- function(analysis_data,
-                     bandwidth = 180,
-                     output_path = NULL) {
+#' Plot RDD
+plot_rdd <- function(data, bandwidth = 180, treatment_date = config$treatment_date) {
 
-  # Aggregate to daily averages
-  daily_data <- analysis_data %>%
+  # Aggregate to daily means
+  daily <- data %>%
     filter(abs(days_from_treatment) <= bandwidth) %>%
-    group_by(days_from_treatment, post_treatment) %>%
-    summarize(
-      mean_distance = mean(match_distance, na.rm = TRUE),
-      n = n(),
-      .groups = "drop"
-    )
+    group_by(days_from_treatment, post) %>%
+    summarize(mean_dist = mean(distance, na.rm = TRUE), n = n(), .groups = "drop")
 
-  p <- ggplot(daily_data, aes(x = days_from_treatment, y = mean_distance)) +
+  ggplot(daily, aes(x = days_from_treatment, y = mean_dist)) +
     geom_point(aes(size = n), alpha = 0.5) +
-    geom_smooth(
-      aes(color = factor(post_treatment)),
-      method = "lm",
-      se = TRUE
-    ) +
+    geom_smooth(aes(color = factor(post)), method = "lm", se = TRUE) +
     geom_vline(xintercept = 0, color = "red", linetype = "dashed") +
-    scale_color_manual(
-      values = c("0" = "steelblue", "1" = "coral"),
-      labels = c("Pre-ChatGPT", "Post-ChatGPT"),
-      name = "Period"
-    ) +
-    scale_size_continuous(name = "Citations") +
+    scale_color_manual(values = c("0" = "steelblue", "1" = "coral"),
+                       labels = c("Pre", "Post"), name = "") +
     labs(
-      title = "Regression Discontinuity: Match Scores Around ChatGPT Release",
-      x = "Days from Treatment (Nov 30, 2022)",
+      title = "RDD: Match Scores Around ChatGPT Release",
+      x = "Days from November 30, 2022",
       y = "Mean Match Distance"
     ) +
     theme_minimal() +
-    theme(
-      plot.title = element_text(face = "bold"),
-      legend.position = "bottom"
-    )
-
-  if (!is.null(output_path)) {
-    ggsave(
-      output_path,
-      p,
-      width = config$output$fig_width,
-      height = config$output$fig_height,
-      dpi = config$output$fig_dpi
-    )
-    message("Saved: ", output_path)
-  }
-
-  return(p)
+    theme(legend.position = "bottom")
 }
 
 # ------------------------------------------------------------------------------
-# ROBUSTNESS CHECKS
+# ROBUSTNESS
 # ------------------------------------------------------------------------------
 
-#' Run placebo tests with fake treatment dates
-#'
-#' @param analysis_data Prepared analysis data
-#' @param placebo_dates Vector of fake treatment dates
-#' @param outcome Outcome variable
-#' @return Tibble with placebo test results
-run_placebo_tests <- function(analysis_data,
-                              placebo_dates,
-                              outcome = "match_distance") {
+#' Test different bandwidths for RDD
+bandwidth_sensitivity <- function(data, bandwidths = c(30, 60, 90, 120, 180, 365)) {
 
-  results <- map_dfr(placebo_dates, function(fake_date) {
+  map_dfr(bandwidths, function(bw) {
+    model <- run_rdd(data, bandwidth = bw)
+    coefs <- summary(model)$coefficients
 
-    # Create fake treatment indicator
-    placebo_data <- analysis_data %>%
+    tibble(
+      bandwidth = bw,
+      estimate = coefs["post", "Estimate"],
+      se = coefs["post", "Std. Error"],
+      pvalue = coefs["post", "Pr(>|t|)"],
+      n = nrow(model$model)
+    )
+  })
+}
+
+#' Placebo tests with fake treatment dates
+placebo_test <- function(data, fake_dates) {
+
+  map_dfr(fake_dates, function(fake_date) {
+    data_fake <- data %>%
       mutate(fake_post = as.integer(pub_date >= fake_date))
 
-    # Run regression
-    model <- lm(as.formula(paste(outcome, "~ fake_post")), data = placebo_data)
-    coef_summary <- summary(model)$coefficients
+    model <- lm(distance ~ fake_post, data = data_fake)
+    coefs <- summary(model)$coefficients
 
     tibble(
-      placebo_date = fake_date,
-      estimate = coef_summary["fake_post", "Estimate"],
-      std_error = coef_summary["fake_post", "Std. Error"],
-      p_value = coef_summary["fake_post", "Pr(>|t|)"]
+      fake_date = fake_date,
+      estimate = coefs["fake_post", "Estimate"],
+      pvalue = coefs["fake_post", "Pr(>|t|)"]
     )
   })
-
-  return(results)
-}
-
-#' Run bandwidth sensitivity analysis
-#'
-#' @param analysis_data Prepared analysis data
-#' @param bandwidths Vector of bandwidth values (in days)
-#' @param outcome Outcome variable
-#' @return Tibble with results at each bandwidth
-bandwidth_sensitivity <- function(analysis_data,
-                                  bandwidths = c(30, 60, 90, 120, 180, 365),
-                                  outcome = "match_distance") {
-
-  results <- map_dfr(bandwidths, function(bw) {
-
-    model <- run_rdd(analysis_data, outcome = outcome, bandwidth = bw)
-    coef_summary <- summary(model)$coefficients
-
-    tibble(
-      bandwidth_days = bw,
-      estimate = coef_summary["post_treatment", "Estimate"],
-      std_error = coef_summary["post_treatment", "Std. Error"],
-      p_value = coef_summary["post_treatment", "Pr(>|t|)"],
-      n_obs = nrow(model$model)
-    )
-  })
-
-  return(results)
 }
 
 # ------------------------------------------------------------------------------
-# EXPORT RESULTS
+# HELPERS
 # ------------------------------------------------------------------------------
 
-#' Export regression results to LaTeX table
-#'
-#' @param models List of lm model objects
-#' @param output_path File path for .tex output
-#' @param model_names Names for each model column
-export_regression_latex <- function(models,
-                                    output_path,
-                                    model_names = NULL) {
+#' Nice summary of regression results
+summarize_model <- function(model) {
+  s <- summary(model)
+  coefs <- as.data.frame(s$coefficients)
 
-  if (is.null(model_names)) {
-    model_names <- paste0("Model ", seq_along(models))
-  }
-
-  # Build coefficient table manually
-  all_terms <- unique(unlist(lapply(models, function(m) names(coef(m)))))
-
-  coef_matrix <- matrix(
-    NA,
-    nrow = length(all_terms) * 2,  # coefficient and SE rows
-    ncol = length(models)
-  )
-
-  for (j in seq_along(models)) {
-    summary_j <- summary(models[[j]])
-    coefs <- summary_j$coefficients
-
-    for (i in seq_along(all_terms)) {
-      term <- all_terms[i]
-      if (term %in% rownames(coefs)) {
-        coef_matrix[(i-1)*2 + 1, j] <- round(coefs[term, "Estimate"], 4)
-        coef_matrix[(i-1)*2 + 2, j] <- round(coefs[term, "Std. Error"], 4)
-      }
-    }
-  }
-
-  # Create LaTeX output
-  latex_lines <- c(
-    "\\begin{table}[htbp]",
-    "\\centering",
-    "\\caption{Regression Results}",
-    paste0("\\begin{tabular}{l", paste(rep("c", length(models)), collapse = ""), "}"),
-    "\\toprule",
-    paste(c("", model_names), collapse = " & ") %>% paste0(" \\\\"),
-    "\\midrule"
-  )
-
-  for (i in seq_along(all_terms)) {
-    coef_row <- coef_matrix[(i-1)*2 + 1, ]
-    se_row <- coef_matrix[(i-1)*2 + 2, ]
-
-    coef_str <- paste(
-      ifelse(is.na(coef_row), "", sprintf("%.4f", coef_row)),
-      collapse = " & "
+  tibble(
+    term = rownames(coefs),
+    estimate = coefs[,1],
+    se = coefs[,2],
+    pvalue = coefs[,4],
+    stars = case_when(
+      pvalue < 0.001 ~ "***",
+      pvalue < 0.01  ~ "**",
+      pvalue < 0.05  ~ "*",
+      pvalue < 0.1   ~ ".",
+      TRUE ~ ""
     )
-    se_str <- paste(
-      ifelse(is.na(se_row), "", sprintf("(%.4f)", se_row)),
-      collapse = " & "
-    )
-
-    latex_lines <- c(
-      latex_lines,
-      paste(all_terms[i], "&", coef_str, "\\\\"),
-      paste("", "&", se_str, "\\\\")
-    )
-  }
-
-  latex_lines <- c(
-    latex_lines,
-    "\\bottomrule",
-    "\\end{tabular}",
-    "\\end{table}"
   )
-
-  writeLines(latex_lines, output_path)
-  message("Exported: ", output_path)
-}
-
-#' Export results summary to CSV
-#'
-#' @param results_list List of analysis results
-#' @param output_path File path for CSV
-export_results_csv <- function(results_list, output_path) {
-
-  write_csv(results_list, output_path)
-  message("Exported: ", output_path)
 }
 
 # ------------------------------------------------------------------------------
-# MAIN EXECUTION (if run as script)
+# RUN AS SCRIPT
 # ------------------------------------------------------------------------------
 
 if (sys.nframe() == 0) {
-  message("\n", strrep("=", 60))
-  message("Causal Estimation Module")
-  message(strrep("=", 60), "\n")
+  message("\n=== Causal Estimation ===\n")
 
-  # Create sample data for demonstration
+  # Demo data
   set.seed(42)
+  treatment_date <- config$treatment_date
+  dates <- seq(treatment_date - 365, treatment_date + 365, by = "day")
 
-  # Generate fake dates around treatment
-  treatment_date <- config$dates$treatment_date
-  fake_dates <- seq(
-    treatment_date - 365,
-    treatment_date + 365,
-    by = "day"
-  )
-
-  sample_data <- tibble(
-    paper_id = paste0("w", sample(31000:32000, 1000, replace = TRUE)),
-    pub_date = sample(fake_dates, 1000, replace = TRUE),
-    match_distance = NA_real_
+  demo_data <- tibble(
+    paper_id = paste0("w", sample(31000:32000, 500, replace = TRUE)),
+    pub_date = sample(dates, 500, replace = TRUE)
   ) %>%
     mutate(
-      post_treatment = as.integer(pub_date >= treatment_date),
+      post = as.integer(pub_date >= treatment_date),
       days_from_treatment = as.numeric(pub_date - treatment_date),
-      # Simulate effect: slightly higher scores post-treatment
-      match_distance = 0.15 + 0.02 * post_treatment +
-                       rnorm(n(), 0, 0.08),
-      potential_hallucination = match_distance > 0.3
+      # Simulate small treatment effect
+      distance = 0.15 + 0.02 * post + rnorm(n(), 0, 0.08)
     )
 
-  # Run DiD
-  message("Running Difference-in-Differences analysis...")
-  did_model <- run_did_regression(sample_data)
-  message("\nDiD Results:")
-  print(summarize_regression(did_model))
+  message("DiD results:")
+  did <- run_did(demo_data)
+  print(summarize_model(did))
 
-  # Run RDD
-  message("\nRunning Regression Discontinuity analysis...")
-  rdd_model <- run_rdd(sample_data, bandwidth = 180)
-  message("\nRDD Results:")
-  print(summarize_regression(rdd_model))
+  message("\nRDD results (180-day bandwidth):")
+  rdd <- run_rdd(demo_data, bandwidth = 180)
+  print(summarize_model(rdd))
 
-  message("\nCausal estimation module loaded successfully.")
+  message("\nBandwidth sensitivity:")
+  print(bandwidth_sensitivity(demo_data))
 }
