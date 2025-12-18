@@ -181,19 +181,27 @@ normalize_wos_corpus <- function(wos_data) {
 
 #' Process NBER citations: add normalized versions
 #'
-#' @param nber_citations Tibble with 'citation' column
+#' Works with both old format ('citation' column) and new parsed format
+#' ('raw_citation' column).
+#'
+#' @param nber_citations Tibble with 'citation' or 'raw_citation' column
 #' @return Tibble with added 'normalized_citation' column
 normalize_nber_citations <- function(nber_citations) {
 
-  if (!"citation" %in% names(nber_citations)) {
-    stop("NBER data must have 'citation' column")
+  # Support both old and new column names
+  citation_col <- if ("raw_citation" %in% names(nber_citations)) {
+    "raw_citation"
+  } else if ("citation" %in% names(nber_citations)) {
+    "citation"
+  } else {
+    stop("NBER data must have 'citation' or 'raw_citation' column")
   }
 
-  message("Processing NBER citations...")
+  message("Processing NBER citations using '", citation_col, "' column...")
 
   nber_citations %>%
     mutate(
-      normalized_citation = normalize_citations(citation, progress = FALSE)
+      normalized_citation = normalize_citations(.data[[citation_col]], progress = FALSE)
     )
 }
 
